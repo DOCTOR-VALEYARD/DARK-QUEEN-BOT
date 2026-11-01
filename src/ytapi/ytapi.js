@@ -1,7 +1,7 @@
 /* =================================================
    🎵 ZARA BOT — YTAPI
    📁 src/ytapi.js
-   👑 ANJINHO
+   👑 DOCTOR VALEYARD
 
    Download de ÁUDIO por API (único método do /play para áudio).
    Sem yt-dlp: cada provedor tem tempo de sobra e é tentado de novo
@@ -23,6 +23,11 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 const { createDecipheriv } = require('crypto');
+
+// 🔄 Downloader yt-dlp com auto-atualização (nunca derruba o boot).
+// Só de dar require já deixa a rotina de atualização agendada em background.
+let autoUpdate = null;
+try { autoUpdate = require('./auto-update'); autoUpdate.iniciarRotinaUpdate(); } catch (e) { console.log('🔄 auto-update indisponível:', e?.message || e); }
 
 const QUALIDADES_AUDIO = [92, 128, 256, 320];
 const QUALIDADES_VIDEO = [144, 240, 360, 480, 720, 1080];
@@ -317,12 +322,78 @@ async function baixarParaArquivo(url, destino, longo = false) {
 }
 
 // =================================================
-// 🎯 FUNÇÃO PRINCIPAL
+// 🍪 COOKIES (OPCIONAL) — só usa se existir um cookies.txt no projeto
 // =================================================
-// baixarAudioApi(videoUrlOuId, destinoSemExtensao, { qualidade })
-//   → { arquivo, titulo, provedor }   (sucesso)
-//   → lança Error com o motivo de cada provedor (falha total)
+// O bot funciona SEM cookies. Se houver um cookies.txt (ex.: o seu),
+// o yt-dlp usa automaticamente pra passar por vídeo com login/idade.
+function acharCookies() {
+    const cands = [
+        process.env.YT_COOKIES,
+        path.join(process.cwd(), 'cookies.txt'),
+        path.join(process.cwd(), 'src', 'ytapi', 'cookies.txt'),
+        path.join(process.cwd(), 'bin', 'cookies.txt'),
+        path.join(process.cwd(), 'youtube.txt'),
+        path.join(__dirname, 'cookies.txt')
+    ].filter(Boolean);
+    for (const c of cands) {
+        try { if (fs.existsSync(c) && fs.statSync(c).size > 0) return c; } catch {}
+    }
+    return null;
+}
 
+// =================================================
+// 🧰 yt-dlp (robusto, cancelável) → baixa direto do YouTube
+// =================================================
+// Devolve { done, kill }: done resolve com { bytes, titulo }; kill mata o
+// processo (usado quando outro provedor ganha a corrida).
+function baixarComYtDlp(id, destino, tipo = 'audio') {
+    let child = null;
+    const done = (async () => {
+        const bin = autoUpdate ? await autoUpdate.garantirYtDlp() : null;
+        if (!bin) throw new Error('yt-dlp indisponível');
+        const url = `https://www.youtube.com/watch?v=${id}`;
+        const base = destino.replace(/\.(mp3|mp4|m4a|webm|opus)$/i, '');
+        const outTmpl = `${base}.%(ext)s`;
+        const cookies = acharCookies();
+        const comum = ['--no-playlist', '--no-warnings', '--no-progress', '--quiet',
+            '--retries', '5', '--fragment-retries', '5', '--socket-timeout', '30',
+            '-o', outTmpl, url];
+        if (cookies) comum.unshift('--cookies', cookies);
+        const args = tipo === 'video'
+            ? ['-f', 'bv*[height<=720]+ba/b[height<=720]/b', '--merge-output-format', 'mp4', ...comum]
+            : ['-f', 'bestaudio/best', '-x', '--audio-format', 'mp3', '--audio-quality', '0', ...comum];
+
+        await new Promise((resolve, reject) => {
+            child = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+            let err = '';
+            child.stderr?.on('data', d => { err += d.toString(); if (err.length > 2000) err = err.slice(-2000); });
+            child.on('error', reject);
+            child.on('close', code => code === 0 ? resolve()
+                : reject(new Error('yt-dlp código ' + code + (err ? ': ' + err.trim().split('\n').pop() : ''))));
+        });
+
+        const dir = path.dirname(base), pref = path.basename(base) + '.';
+        const irmaos = fs.readdirSync(dir).filter(f => f.startsWith(pref));
+        const finais = irmaos.filter(f => !f.endsWith('.part')).map(f => path.join(dir, f));
+        if (!finais.length) throw new Error('yt-dlp não gerou arquivo');
+        const gerado = finais.sort((a, b) => fs.statSync(b).size - fs.statSync(a).size)[0];
+        const bytes = fs.statSync(gerado).size;
+        if (bytes < 10000) { try { fs.unlinkSync(gerado); } catch {} throw new Error('arquivo yt-dlp veio vazio'); }
+        if (gerado !== destino) { try { fs.renameSync(gerado, destino); } catch { fs.copyFileSync(gerado, destino); try { fs.unlinkSync(gerado); } catch {} } }
+        for (const f of irmaos) { const p = path.join(dir, f); if (p !== destino) { try { fs.unlinkSync(p); } catch {} } }
+        return { bytes, titulo: null };
+    })();
+    return { done, kill: () => { try { child && child.kill('SIGKILL'); } catch {} } };
+}
+
+// =================================================
+// 🎯 FUNÇÃO PRINCIPAL — todos os métodos EM PARALELO (quem entrega primeiro, ganha)
+// =================================================
+// Sem tempo de espera entre métodos: Savetube, Vreden, YouTube direto
+// (youtubei.js) e yt-dlp disputam ao mesmo tempo. O primeiro que terminar
+// vence, os outros são cancelados. Nenhum provedor fica "em pausa".
+//   → { arquivo, titulo, provedor }   (sucesso)
+//   → lança Error só se TODOS falharem
 async function baixarMidiaApi(videoUrlOuId, destinoSemExtensao, opcoes = {}) {
     const tipo = opcoes.tipo === 'video' ? 'video' : 'audio';
     const id = extrairIdYoutube(videoUrlOuId);
@@ -330,56 +401,79 @@ async function baixarMidiaApi(videoUrlOuId, destinoSemExtensao, opcoes = {}) {
 
     const videoUrl = `https://www.youtube.com/watch?v=${id}`;
     const qualidade = escolherQualidade(opcoes.qualidade, tipo);
-    const destino = `${destinoSemExtensao}.${tipo === 'video' ? 'mp4' : 'mp3'}`;
+    const ext = tipo === 'video' ? 'mp4' : 'mp3';
+    const destino = `${destinoSemExtensao}.${ext}`;
 
-    const provedores = [
-        { nome: 'Savetube', obter: obterLinkSavetube },
-        { nome: 'Vreden', obter: obterLinkVreden },
-        { nome: 'YouTube direto', baixar: baixarDiretoYoutube }
-    ];
+    // Prazo generoso só pra limpar pendências — a corrida devolve no 1º sucesso,
+    // então o usuário NUNCA espera pelo mais lento.
+    const prazo = opcoes.longo ? TIMEOUT_ARQUIVO_LONGO : 3 * 60000;
 
-    const falhas = [];
+    const tmps = [];
+    const canceladores = [];
+    const tmpDe = (nome) => { const t = `${destinoSemExtensao}.${nome}.part.${ext}`; tmps.push(t); return t; };
 
-    for (const p of provedores) {
-        const ate = emPausa.get(p.nome) || 0;
-        if (ate > Date.now()) {
-            falhas.push(`${p.nome}: em pausa (${Math.ceil((ate - Date.now()) / 60000)} min)`);
-            continue; // pulado sem perder tempo
-        }
-        for (let tentativa = 1; tentativa <= TENTATIVAS_POR_PROVEDOR; tentativa++) {
-            try {
-                console.log(`🎵 [YTAPI] Tentando ${p.nome}${tentativa > 1 ? ` (tentativa ${tentativa})` : ''}...`);
-                let bytes, titulo;
-                if (p.baixar) {
-                    const prazo = opcoes.longo ? TIMEOUT_ARQUIVO_LONGO : TIMEOUT_ARQUIVO + PRAZO_LINK_MS;
-                    ({ bytes, titulo } = await comPrazo(p.baixar(id, destino, tipo), prazo, p.nome));
-                } else {
-                    const link = await comPrazo(p.obter(videoUrl, qualidade, tipo), opcoes.longo ? PRAZO_LINK_LONGO_MS : PRAZO_LINK_MS, p.nome);
-                    titulo = link.titulo;
-                    bytes = await baixarParaArquivo(link.url, destino, !!opcoes.longo);
-                }
-                console.log(`🎵 [YTAPI] ✅ ${p.nome} entregou ${(bytes / 1024 / 1024).toFixed(2)} MB`);
-                return { arquivo: destino, titulo, provedor: p.nome };
-            } catch (erro) {
-                const motivo = motivoDoErro(erro);
-                const minutos = minutosDePausa(erro);
-                try { if (fs.existsSync(destino)) fs.unlinkSync(destino); } catch {}
-                // só repete se foi lentidão/queda; erro definitivo ou do vídeo vai pro próximo provedor
-                const repetir = tentativa < TENTATIVAS_POR_PROVEDOR
-                    && (ERROS_LENTIDAO.has(erro?.code) || Number(erro?.response?.status || 0) >= 500);
-                if (repetir) {
-                    console.log(`🎵 [YTAPI] ⚠️ ${p.nome} falhou: ${motivo} — tentando de novo...`);
-                    continue;
-                }
-                if (minutos > 0) emPausa.set(p.nome, Date.now() + minutos * 60000);
-                console.log(`🎵 [YTAPI] ❌ ${p.nome} falhou: ${motivo}${minutos ? ` (pulando por ${minutos} min)` : ''}`);
-                falhas.push(`${p.nome}: ${motivo}`);
-                break;
-            }
-        }
+    const corredores = [];
+
+    // 1) yt-dlp (cancelável)
+    corredores.push((async () => {
+        const t = tmpDe('ytdlp');
+        const h = baixarComYtDlp(id, t, tipo);
+        canceladores.push(h.kill);
+        await comPrazo(h.done, prazo, 'yt-dlp');
+        return { arquivo: t, titulo: null, provedor: 'yt-dlp' };
+    })());
+
+    // 2) APIs de link (Savetube / Vreden) — cada uma corre sozinha
+    for (const api of [{ nome: 'Savetube', obter: obterLinkSavetube }, { nome: 'Vreden', obter: obterLinkVreden }]) {
+        corredores.push((async () => {
+            const link = await comPrazo(api.obter(videoUrl, qualidade, tipo), opcoes.longo ? PRAZO_LINK_LONGO_MS : PRAZO_LINK_MS, api.nome);
+            const t = tmpDe(api.nome);
+            await comPrazo(baixarParaArquivo(link.url, t, !!opcoes.longo), prazo, api.nome);
+            return { arquivo: t, titulo: link.titulo, provedor: api.nome };
+        })());
     }
 
-    throw new Error(`API de ${tipo === 'video' ? 'vídeo' : 'áudio'} indisponível (${falhas.join(' | ')})`);
+    // 3) YouTube direto (youtubei.js)
+    corredores.push((async () => {
+        const t = tmpDe('youtubei');
+        const r = await comPrazo(baixarDiretoYoutube(id, t, tipo), prazo, 'YouTube direto');
+        return { arquivo: t, titulo: r?.titulo || null, provedor: 'YouTube direto' };
+    })());
+
+    const limpar = () => {
+        for (const k of canceladores) { try { k && k(); } catch {} }
+        for (const t of tmps) { if (t !== destino) { try { if (fs.existsSync(t)) fs.unlinkSync(t); } catch {} } }
+    };
+
+    let vencedor;
+    try {
+        vencedor = await Promise.any(corredores);
+    } catch (agg) {
+        limpar();
+        const motivos = (agg && agg.errors ? agg.errors : []).map(e => motivoDoErro(e)).filter(Boolean);
+        const resumo = motivos.length ? [...new Set(motivos)].join(' | ') : 'todos os métodos falharam';
+        throw new Error(`Não consegui baixar de nenhuma fonte (${resumo})`);
+    }
+
+    // move o arquivo vencedor pro destino final e cancela/limpa os perdedores
+    try {
+        if (vencedor.arquivo !== destino) {
+            try { fs.renameSync(vencedor.arquivo, destino); }
+            catch { fs.copyFileSync(vencedor.arquivo, destino); try { fs.unlinkSync(vencedor.arquivo); } catch {} }
+        }
+    } catch (e) {
+        limpar();
+        throw new Error('Baixei, mas não consegui salvar o arquivo: ' + (e?.message || e));
+    }
+    // cancela os outros corredores e apaga os temporários que sobraram
+    for (const k of canceladores) { try { k && k(); } catch {} }
+    for (const t of tmps) { if (t !== destino) { try { if (fs.existsSync(t)) fs.unlinkSync(t); } catch {} } }
+    // os perdedores que ainda estão rodando não quebram nada: seus temporários
+    // serão apagados por eles mesmos ou ignorados.
+    corredores.forEach(p => p.catch(() => {}));
+
+    console.log(`🎵 [YTAPI] ✅ ${vencedor.provedor} entregou primeiro.`);
+    return { arquivo: destino, titulo: vencedor.titulo, provedor: vencedor.provedor };
 }
 
 const baixarAudioApi = (v, d, o = {}) => baixarMidiaApi(v, d, { ...o, tipo: 'audio' });

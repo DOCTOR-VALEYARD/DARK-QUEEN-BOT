@@ -1,2 +1,11 @@
 node_modules/
-tmp/
+*.log
+bin/
+session/
+**/session/
+creds.json
+*.session
+cookies.txt
+youtube.txt
+.env
+database/usuarios.json

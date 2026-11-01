@@ -57,7 +57,7 @@ const config = {
     "anjinho",
 
   OWNER_NUMBER:
-    "5516998761099",
+    "",
 
   // 📢 LINK DO CANAL
   // Cole aqui o link/identificador do canal que será aberto pelo botão
