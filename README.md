@@ -72,7 +72,7 @@ pkg install -y nodejs git ffmpeg
 **2. Baixe o bot do seu repositório:**
 
 ```bash
-git clone SEU_REPOSITORIO_AQUI
+git clone https://github.com/DOCTOR-VALEYARD/DARK-QUEEN-BOT
 cd DarkQueenBot
 ```
 
